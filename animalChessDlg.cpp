@@ -1,44 +1,51 @@
-﻿#include "pch.h"
+﻿// animalChessDlg.cpp : 对局窗口实现（详见 animalChessDlg.h）
+#include "pch.h"
 #include "framework.h"
 #include "animalChess.h"
 #include "animalChessDlg.h"
+#include "AnimalChessNet.h"
 #include "afxdialogex.h"
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
 #endif
 
-namespace {
-constexpr UINT IDC_LAN_ADDRESS = 5001;
-constexpr UINT IDC_LAN_PORT = 5002;
-constexpr UINT IDC_LOCAL_AI = 5003;
-constexpr UINT IDC_LAN_HOST = 5004;
-constexpr UINT IDC_LAN_JOIN = 5005;
-constexpr UINT IDC_LAN_DISCONNECT = 5006;
+// 棋盘绘制常量（与点击坐标换算保持一致）
+static const int GRID_SIZE = 65;
+static const int OFFSET_X = 30;
+static const int OFFSET_Y = 40;
 
-constexpr int LAN_PANEL_LEFT = 635;
-constexpr int LAN_PANEL_RIGHT = 895;
+static const wchar_t* AI_LEVEL_NAMES[3] = { L"简单", L"中等", L"困难" };
 
-CString Utf8ToCString(const std::string& value)
+static CString PieceNameW(uint8_t pc)
 {
-    return CString(CA2T(value.c_str(), CP_UTF8));
-}
-
-std::string CStringToUtf8(const CString& value)
-{
-    return std::string(CT2A(value, CP_UTF8));
-}
+    const char* s = Engine_GetPieceName(pc);
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+    if (n <= 1) return CString();
+    CString out;
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, out.GetBuffer(n), n);
+    out.ReleaseBuffer();
+    return out;
 }
 
 CanimalChessDlg::CanimalChessDlg(CWnd* pParent /*=nullptr*/)
     : CDialogEx(IDD_ANIMALCHESS_DIALOG, pParent)
     , m_selectedIdx(-1)
-    , m_gameMode(GameMode::LocalAi)
-    , m_waitingForGuestConfirmation(false)
-    , m_pendingSrc(255)
-    , m_pendingDst(255)
+    , m_aiMode(true)
+    , m_myCamp(0)
+    , m_aiLevel(2)
+    , m_netSock(INVALID_SOCKET)
+    , m_netRecvThread(nullptr)
+    , m_netClosing(false)
 {
     m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
+
+    // 默认参数：人机/中等（实际会在 SetLaunchInfo 中被大厅覆盖）
+    m_launch.mode = GAME_MODE_AI;
+    m_launch.aiLevel = 2;
+    m_launch.netIsHost = true;
+    m_launch.netLocalCamp = 0;
+    m_launch.netSocket = INVALID_SOCKET;
 }
 
 void CanimalChessDlg::DoDataExchange(CDataExchange* pDX)
@@ -50,14 +57,35 @@ BEGIN_MESSAGE_MAP(CanimalChessDlg, CDialogEx)
     ON_WM_PAINT()
     ON_WM_QUERYDRAGICON()
     ON_WM_LBUTTONDOWN()
-    ON_BN_CLICKED(IDC_LOCAL_AI, &CanimalChessDlg::OnLocalAiClicked)
-    ON_BN_CLICKED(IDC_LAN_HOST, &CanimalChessDlg::OnHostClicked)
-    ON_BN_CLICKED(IDC_LAN_JOIN, &CanimalChessDlg::OnJoinClicked)
-    ON_BN_CLICKED(IDC_LAN_DISCONNECT, &CanimalChessDlg::OnDisconnectClicked)
-    ON_MESSAGE(WM_APP_LAN_STATE_CHANGED, &CanimalChessDlg::OnLanStateChanged)
-    ON_MESSAGE(WM_APP_LAN_MOVE_RECEIVED, &CanimalChessDlg::OnLanMoveReceived)
+    ON_WM_TIMER()
     ON_WM_DESTROY()
+    ON_BN_CLICKED(IDC_GAME_RESTART, &CanimalChessDlg::OnBnClickedRestart)
+    ON_BN_CLICKED(IDC_GAME_BACK, &CanimalChessDlg::OnBnClickedBackLobby)
+    ON_MESSAGE(WM_GAME_NET_MOVE, &CanimalChessDlg::OnNetMove)
+    ON_MESSAGE(WM_GAME_NET_CLOSED, &CanimalChessDlg::OnNetClosed)
 END_MESSAGE_MAP()
+
+const wchar_t* CanimalChessDlg::DifficultyName() const
+{
+    int idx = m_aiLevel - 1;
+    if (idx < 0) idx = 0;
+    if (idx > 2) idx = 2;
+    return AI_LEVEL_NAMES[idx];
+}
+
+bool CanimalChessDlg::IsMyColor(uint8_t pc) const
+{
+    if (m_myCamp == 0) return pc >= 1 && pc <= 8;      // 红方棋子 1~8
+    return pc >= 17 && pc <= 24;                       // 蓝方棋子 17~24
+}
+
+bool CanimalChessDlg::IsMyTurn(const MsgBoardSnapshot& snap) const
+{
+    if (snap.gameStatus != 0) return false;
+    if (snap.currentTurn != m_myCamp) return false;
+    if (m_aiMode && Engine_IsAiThinking()) return false;   // 电脑思考中不允许抢先操作
+    return true;
+}
 
 BOOL CanimalChessDlg::OnInitDialog()
 {
@@ -70,382 +98,74 @@ BOOL CanimalChessDlg::OnInitDialog()
     ModifyStyle(0, WS_CLIPCHILDREN);
     SetWindowPos(NULL, 0, 0, 930, 560, SWP_NOMOVE | SWP_NOZORDER);
 
-    Engine_Startup();
-    CreateNetworkControls();
-    UpdateNetworkControls();
+    // ---------- 记录本局模式参数 ----------
+    m_aiMode = (m_launch.mode == GAME_MODE_AI);
+    m_aiLevel = m_launch.aiLevel;
+    if (m_aiLevel < 1 || m_aiLevel > 3) m_aiLevel = 2;
+    m_myCamp = (m_aiMode ? 0 : m_launch.netLocalCamp);
+    if (m_myCamp != 0 && m_myCamp != 1) m_myCamp = 0;
+    m_netSock = m_launch.netSocket;
+    m_netClosing = false;
+
+    // ---------- 窗口标题：标明模式/难度/阵营 ----------
+    CString title;
+    if (m_aiMode) {
+        title.Format(L"斗兽棋 · 人机对战（%s难度）", DifficultyName());
+    }
+    else {
+        title.Format(L"斗兽棋 · 联机对战（%s%s）",
+            m_myCamp == 0 ? L"红方" : L"蓝方",
+            m_launch.netIsHost ? L"·主机" : L"·客机");
+    }
+    SetWindowText(title);
+
+    // ---------- 顶部按钮：重新开局 / 返回大厅 ----------
+    {
+        CRect rc;
+        GetClientRect(&rc);
+        const int btnW = 96, btnH = 24, gap = 8;
+        int y = 5;
+        int x2 = rc.right - 24 - btnW;
+        int x1 = x2 - gap - btnW;
+
+        m_uiFont.CreatePointFont(105, L"微软雅黑");
+        m_btnRestart.Create(m_aiMode ? L"重新开局" : L"重新开局", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            CRect(x1, y, x1 + btnW, y + btnH), this, IDC_GAME_RESTART);
+        m_btnBack.Create(L"返回大厅", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            CRect(x2, y, x2 + btnW, y + btnH), this, IDC_GAME_BACK);
+        m_btnRestart.SetFont(&m_uiFont);
+        m_btnBack.SetFont(&m_uiFont);
+
+        if (!m_aiMode) m_btnRestart.EnableWindow(FALSE);   // 联机对局不支持单方重开
+    }
+
+    // ---------- 引擎复位并开局 ----------
+    Engine_SetAiLevel(m_aiLevel);
+    StartNewGame();
+
+    // ---------- 联机模式：启动接收线程 ----------
+    if (!m_aiMode && m_netSock != INVALID_SOCKET) {
+        m_netRecvThread = Net_StartGameRecv(m_hWnd, m_netSock);
+    }
 
     return TRUE;
 }
 
-void CanimalChessDlg::CreateNetworkControls()
+void CanimalChessDlg::StartNewGame()
 {
-    const DWORD childTextStyle = WS_CHILD | WS_VISIBLE;
-
-    m_lanGroup.Create(_T("局域网联机"), childTextStyle | BS_GROUPBOX,
-        CRect(LAN_PANEL_LEFT, 32, LAN_PANEL_RIGHT, 472), this, 0);
-    m_addressLabel.Create(_T("房主地址"), childTextStyle,
-        CRect(LAN_PANEL_LEFT + 15, 62, LAN_PANEL_RIGHT - 15, 82), this);
-    m_addressEdit.Create(childTextStyle | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-        CRect(LAN_PANEL_LEFT + 15, 84, LAN_PANEL_RIGHT - 15, 108), this, IDC_LAN_ADDRESS);
-    m_addressEdit.SetWindowText(_T("127.0.0.1"));
-    m_addressEdit.LimitText(253);
-
-    m_portLabel.Create(_T("端口"), childTextStyle,
-        CRect(LAN_PANEL_LEFT + 15, 118, LAN_PANEL_RIGHT - 15, 138), this);
-    m_portEdit.Create(childTextStyle | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER,
-        CRect(LAN_PANEL_LEFT + 15, 140, LAN_PANEL_RIGHT - 15, 164), this, IDC_LAN_PORT);
-    m_portEdit.SetWindowText(_T("9002"));
-    m_portEdit.LimitText(5);
-
-    m_localAiButton.Create(_T("本地人机（重新开始）"), childTextStyle | WS_TABSTOP | BS_PUSHBUTTON,
-        CRect(LAN_PANEL_LEFT + 15, 182, LAN_PANEL_RIGHT - 15, 212), this, IDC_LOCAL_AI);
-    m_hostButton.Create(_T("创建房间（红方）"), childTextStyle | WS_TABSTOP | BS_PUSHBUTTON,
-        CRect(LAN_PANEL_LEFT + 15, 220, LAN_PANEL_RIGHT - 15, 250), this, IDC_LAN_HOST);
-    m_joinButton.Create(_T("加入房间（蓝方）"), childTextStyle | WS_TABSTOP | BS_PUSHBUTTON,
-        CRect(LAN_PANEL_LEFT + 15, 258, LAN_PANEL_RIGHT - 15, 288), this, IDC_LAN_JOIN);
-    m_disconnectButton.Create(_T("断开联机"), childTextStyle | WS_TABSTOP | BS_PUSHBUTTON,
-        CRect(LAN_PANEL_LEFT + 15, 296, LAN_PANEL_RIGHT - 15, 326), this, IDC_LAN_DISCONNECT);
-    m_networkStatus.Create(_T("状态：本地人机"), childTextStyle | SS_LEFT,
-        CRect(LAN_PANEL_LEFT + 15, 346, LAN_PANEL_RIGHT - 15, 452), this);
-
-    CFont* font = GetFont();
-    CWnd* controls[] = {
-        &m_lanGroup, &m_addressLabel, &m_addressEdit, &m_portLabel, &m_portEdit,
-        &m_localAiButton, &m_hostButton, &m_joinButton, &m_disconnectButton,
-        &m_networkStatus
-    };
-    for (CWnd* control : controls) {
-        control->SetFont(font);
-    }
-}
-
-void CanimalChessDlg::SetNetworkStatus(const CString& text)
-{
-    if (m_networkStatus.GetSafeHwnd() != nullptr) {
-        m_networkStatus.SetWindowText(text);
-    }
-}
-
-bool CanimalChessDlg::ReadPort(uint16_t& port) const
-{
-    CString portText;
-    m_portEdit.GetWindowText(portText);
-    portText.Trim();
-
-    if (portText.IsEmpty()) return false;
-
-    TCHAR* end = nullptr;
-    const unsigned long parsedPort = _tcstoul(portText.GetString(), &end, 10);
-    if (end == portText.GetString() || *end != _T('\0') || parsedPort == 0 || parsedPort > 65535) {
-        return false;
-    }
-
-    port = static_cast<uint16_t>(parsedPort);
-    return true;
-}
-
-bool CanimalChessDlg::ReadConnectionSettings(CString& address, uint16_t& port) const
-{
-    m_addressEdit.GetWindowText(address);
-    address.Trim();
-    return !address.IsEmpty() && ReadPort(port);
-}
-
-bool CanimalChessDlg::IsLocalPlayersTurn(const MsgBoardSnapshot& snap) const
-{
-    if (snap.gameStatus != 0) return false;
-
-    switch (m_gameMode) {
-    case GameMode::LocalAi:
-        return snap.currentTurn == 0;
-    case GameMode::LanHost:
-        return m_lanSession.GetState() == LanState::Connected && snap.currentTurn == 0;
-    case GameMode::LanGuest:
-        return m_lanSession.GetState() == LanState::Connected &&
-            !m_waitingForGuestConfirmation && snap.currentTurn == 1;
-    }
-    return false;
-}
-
-bool CanimalChessDlg::IsLocalPiece(uint8_t piece) const
-{
-    if (m_gameMode == GameMode::LanGuest) {
-        return piece >= 17 && piece <= 24;
-    }
-    return piece >= 1 && piece <= 8;
-}
-
-void CanimalChessDlg::ResetSelection()
-{
+    KillTimer(GAME_TIMER_AI);
     m_selectedIdx = -1;
-}
-
-void CanimalChessDlg::UpdateNetworkControls()
-{
-    if (m_addressEdit.GetSafeHwnd() == nullptr) return;
-
-    const LanState state = m_lanSession.GetState();
-    const bool sessionActive = state == LanState::Hosting ||
-        state == LanState::Connecting || state == LanState::Connected;
-
-    m_addressEdit.EnableWindow(!sessionActive);
-    m_portEdit.EnableWindow(!sessionActive);
-    m_hostButton.EnableWindow(!sessionActive);
-    m_joinButton.EnableWindow(!sessionActive);
-    m_disconnectButton.EnableWindow(sessionActive);
-    m_localAiButton.EnableWindow(TRUE);
-}
-
-void CanimalChessDlg::OnLocalAiClicked()
-{
-    m_lanSession.Stop();
-    m_gameMode = GameMode::LocalAi;
-    m_waitingForGuestConfirmation = false;
-    m_pendingSrc = 255;
-    m_pendingDst = 255;
-    ResetSelection();
-    Engine_Startup();
-    SetNetworkStatus(_T("状态：本地人机"));
-    UpdateNetworkControls();
+    Engine_Startup();          // 内部会自动中止并回收上一局的 AI 后台思考
     Invalidate(FALSE);
 }
 
-void CanimalChessDlg::OnHostClicked()
+void CanimalChessDlg::OnDestroy()
 {
-    uint16_t port = 0;
-    if (!ReadPort(port)) {
-        SetNetworkStatus(_T("状态：请输入有效端口（1-65535）"));
-        return;
+    KillTimer(GAME_TIMER_AI);
+    if (!m_aiMode && m_netSock != INVALID_SOCKET) {
+        Net_CloseSession(m_netSock, m_netRecvThread);   // 断开并回收接收线程
     }
-
-    m_lanSession.Stop();
-    m_gameMode = GameMode::LanHost;
-    m_waitingForGuestConfirmation = false;
-    m_pendingSrc = 255;
-    m_pendingDst = 255;
-    ResetSelection();
-    Engine_Startup();
-
-    if (!m_lanSession.StartHost(GetSafeHwnd(), port)) {
-        CString status;
-        status.Format(_T("状态：创建房间失败\r\n%s"),
-            Utf8ToCString(m_lanSession.GetLastError()).GetString());
-        SetNetworkStatus(status);
-    }
-    else {
-        CString status;
-        status.Format(_T("状态：等待蓝方加入\r\n本机 IPv4：%s\r\n端口：%u"),
-            Utf8ToCString(LanSession::GetLocalIPv4Address()).GetString(),
-            static_cast<unsigned int>(port));
-        SetNetworkStatus(status);
-    }
-
-    UpdateNetworkControls();
-    Invalidate(FALSE);
-}
-
-void CanimalChessDlg::OnJoinClicked()
-{
-    CString address;
-    uint16_t port = 0;
-    if (!ReadConnectionSettings(address, port)) {
-        SetNetworkStatus(_T("状态：请输入有效地址和端口（1-65535）"));
-        return;
-    }
-
-    m_lanSession.Stop();
-    m_gameMode = GameMode::LanGuest;
-    m_waitingForGuestConfirmation = false;
-    m_pendingSrc = 255;
-    m_pendingDst = 255;
-    ResetSelection();
-    Engine_Startup();
-
-    if (!m_lanSession.Connect(GetSafeHwnd(), CStringToUtf8(address), port)) {
-        CString status;
-        status.Format(_T("状态：连接失败\r\n%s"),
-            Utf8ToCString(m_lanSession.GetLastError()).GetString());
-        SetNetworkStatus(status);
-    }
-    else {
-        CString status;
-        status.Format(_T("状态：正在连接 %s:%u..."), address.GetString(),
-            static_cast<unsigned int>(port));
-        SetNetworkStatus(status);
-    }
-
-    UpdateNetworkControls();
-    Invalidate(FALSE);
-}
-
-void CanimalChessDlg::OnDisconnectClicked()
-{
-    m_lanSession.Stop();
-    m_waitingForGuestConfirmation = false;
-    m_pendingSrc = 255;
-    m_pendingDst = 255;
-    ResetSelection();
-    SetNetworkStatus(_T("状态：联机已停止，可重新创建或加入房间"));
-    UpdateNetworkControls();
-    Invalidate(FALSE);
-}
-
-LRESULT CanimalChessDlg::OnLanStateChanged(WPARAM wParam, LPARAM lParam)
-{
-    if (LanNotificationGeneration(wParam) != m_lanSession.GetGeneration()) return 0;
-
-    const LanState state = static_cast<LanState>(LanNotificationValue(wParam));
-    const LanRole role = static_cast<LanRole>(lParam);
-
-    // 同一会话可能快速经历多个状态；忽略已被后续状态取代的排队消息。
-    if (state != m_lanSession.GetState()) return 0;
-
-    if (role == LanRole::Host) m_gameMode = GameMode::LanHost;
-    else if (role == LanRole::Guest) m_gameMode = GameMode::LanGuest;
-
-    CString status;
-    switch (state) {
-    case LanState::Stopped:
-        if (m_gameMode == GameMode::LocalAi) {
-            status = _T("状态：本地人机");
-        }
-        else {
-            status = _T("状态：联机已停止，可重新创建或加入房间");
-        }
-        break;
-    case LanState::Hosting:
-    {
-        uint16_t port = 0;
-        ReadPort(port);
-        status.Format(_T("状态：等待蓝方加入\r\n本机 IPv4：%s\r\n端口：%u"),
-            Utf8ToCString(LanSession::GetLocalIPv4Address()).GetString(),
-            static_cast<unsigned int>(port));
-        break;
-    }
-    case LanState::Connecting:
-        status = _T("状态：正在连接房主...");
-        break;
-    case LanState::Connected:
-        status = (role == LanRole::Host)
-            ? _T("状态：已连接，你是红方（先手）")
-            : _T("状态：已连接，你是蓝方（后手）");
-        break;
-    case LanState::Disconnected:
-        status = _T("状态：对方已断开，可重新创建或加入房间");
-        m_waitingForGuestConfirmation = false;
-        m_pendingSrc = 255;
-        m_pendingDst = 255;
-        ResetSelection();
-        break;
-    case LanState::Failed:
-        status.Format(_T("状态：联机失败\r\n%s"),
-            Utf8ToCString(m_lanSession.GetLastError()).GetString());
-        m_waitingForGuestConfirmation = false;
-        m_pendingSrc = 255;
-        m_pendingDst = 255;
-        ResetSelection();
-        break;
-    }
-
-    SetNetworkStatus(status);
-    UpdateNetworkControls();
-    Invalidate(FALSE);
-    return 0;
-}
-
-LRESULT CanimalChessDlg::OnLanMoveReceived(WPARAM wParam, LPARAM lParam)
-{
-    if (LanNotificationGeneration(wParam) != m_lanSession.GetGeneration()) return 0;
-    if (m_lanSession.GetState() != LanState::Connected) return 0;
-
-    const uint8_t src = LanNotificationValue(wParam);
-    if (src >= BOARD_CELL_COUNT || lParam < 0 ||
-        static_cast<WPARAM>(lParam) >= BOARD_CELL_COUNT) {
-        SetNetworkStatus(_T("状态：收到无效走子数据，联机已停止"));
-        m_waitingForGuestConfirmation = false;
-        m_pendingSrc = 255;
-        m_pendingDst = 255;
-        ResetSelection();
-        m_lanSession.Stop();
-        UpdateNetworkControls();
-        Invalidate(FALSE);
-        return 0;
-    }
-
-    const uint8_t dst = static_cast<uint8_t>(lParam);
-    MsgBoardSnapshot snap{};
-    Engine_GetSnapshot(snap);
-
-    if (m_lanSession.GetRole() == LanRole::Host && m_gameMode == GameMode::LanHost) {
-        const uint8_t sourcePiece = snap.board[src];
-        const bool isBlueTurnRequest = snap.gameStatus == 0 && snap.currentTurn == 1 &&
-            sourcePiece >= 17 && sourcePiece <= 24;
-
-        // 房主是唯一规则权威；网络层只传请求，规则仍在 UI/引擎线程仲裁。
-        if (!isBlueTurnRequest || !Engine_IsLegalMove(src, dst) || !Engine_TryMove(src, dst)) {
-            SetNetworkStatus(_T("状态：收到蓝方非法走子，联机已停止"));
-            m_waitingForGuestConfirmation = false;
-            m_pendingSrc = 255;
-            m_pendingDst = 255;
-            ResetSelection();
-            m_lanSession.Stop();
-            UpdateNetworkControls();
-            Invalidate(FALSE);
-            return 0;
-        }
-
-        if (!m_lanSession.SendMove(src, dst)) {
-            SetNetworkStatus(_T("状态：走子已执行，但回传蓝方失败"));
-        }
-        else {
-            SetNetworkStatus(_T("状态：已连接，你是红方（先手）"));
-        }
-
-        ResetSelection();
-        Invalidate(FALSE);
-        return 0;
-    }
-
-    if (m_lanSession.GetRole() == LanRole::Guest && m_gameMode == GameMode::LanGuest) {
-        const uint8_t sourcePiece = snap.board[src];
-        const bool isBlueMove = sourcePiece >= 17 && sourcePiece <= 24;
-
-        if (isBlueMove && (!m_waitingForGuestConfirmation ||
-            src != m_pendingSrc || dst != m_pendingDst)) {
-            SetNetworkStatus(_T("状态：主机确认与本地请求不一致，联机已停止"));
-            m_waitingForGuestConfirmation = false;
-            m_pendingSrc = 255;
-            m_pendingDst = 255;
-            ResetSelection();
-            m_lanSession.Stop();
-            UpdateNetworkControls();
-            Invalidate(FALSE);
-            return 0;
-        }
-
-        if (!Engine_IsLegalMove(src, dst) || !Engine_TryMove(src, dst)) {
-            SetNetworkStatus(_T("状态：双方棋局不同步，联机已停止"));
-            m_waitingForGuestConfirmation = false;
-            m_pendingSrc = 255;
-            m_pendingDst = 255;
-            ResetSelection();
-            m_lanSession.Stop();
-            UpdateNetworkControls();
-            Invalidate(FALSE);
-            return 0;
-        }
-
-        if (isBlueMove) {
-            m_waitingForGuestConfirmation = false;
-            m_pendingSrc = 255;
-            m_pendingDst = 255;
-        }
-        SetNetworkStatus(_T("状态：已连接，你是蓝方（后手）"));
-        ResetSelection();
-        Invalidate(FALSE);
-    }
-
-    return 0;
+    CDialogEx::OnDestroy();
 }
 
 void CanimalChessDlg::DrawMoveArrow(CDC* pDC, CPoint ptStart, CPoint ptEnd)
@@ -495,10 +215,6 @@ void CanimalChessDlg::OnPaint()
     //拉取快照，纯依据快照数据绘制。
     MsgBoardSnapshot snap;
     Engine_GetSnapshot(snap);
-
-    const int GRID_SIZE = 65;
-    const int OFFSET_X = 30;
-    const int OFFSET_Y = 40;
 
     for (uint8_t i = 0; i < BOARD_CELL_COUNT; i++) {
         int row = i / BOARD_COLS;
@@ -555,7 +271,7 @@ void CanimalChessDlg::OnPaint()
             font.CreatePointFont(130, _T("微软雅黑"));
             CFont* pOldFont = memDC.SelectObject(&font);
 
-            CString strName = CA2T(Engine_GetPieceName(pc));
+            CString strName = PieceNameW(pc);
             memDC.DrawText(strName, &pieceRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
             memDC.SelectObject(pOldFont);
@@ -587,8 +303,8 @@ void CanimalChessDlg::OnPaint()
         DrawMoveArrow(&memDC, ptStart, ptEnd);
     }
 
-    //状态文本提示。
-    CRect statusRc(OFFSET_X, 8, 615, 32);
+    //状态文本提示（右侧预留按钮区域）。
+    CRect statusRc(OFFSET_X, 8, clientRc.right - 230, 32);
     memDC.SetBkMode(TRANSPARENT);
     memDC.SetTextColor(RGB(60, 60, 60));
     CFont statusFont;
@@ -599,44 +315,27 @@ void CanimalChessDlg::OnPaint()
     if (snap.gameStatus == 1) strInfo = _T("【对局结束】红方取得胜利！");
     else if (snap.gameStatus == 2) strInfo = _T("【对局结束】蓝方取得胜利！");
     else if (snap.gameStatus == 3) strInfo = _T("【对局结束】双方和棋！");
-    else if (m_gameMode == GameMode::LocalAi) {
-        strInfo = (snap.currentTurn == 0)
-            ? _T("【当前回合】玩家（红方）")
-            : _T("【当前回合】电脑（蓝方）思考中...");
-    }
-    else if (m_gameMode == GameMode::LanHost) {
-        const LanState state = m_lanSession.GetState();
-        if (state == LanState::Hosting) {
-            strInfo = _T("【局域网】等待蓝方连接...");
-        }
-        else if (state == LanState::Connected) {
-            strInfo = (snap.currentTurn == 0)
-                ? _T("【你的回合】红方")
-                : _T("【对方回合】等待蓝方走子...");
-        }
-        else {
-            strInfo = _T("【局域网】当前未连接");
-        }
-    }
     else {
-        const LanState state = m_lanSession.GetState();
-        if (state == LanState::Connecting) {
-            strInfo = _T("【局域网】正在连接红方...");
-        }
-        else if (state != LanState::Connected) {
-            strInfo = _T("【局域网】当前未连接");
-        }
-        else if (m_waitingForGuestConfirmation) {
-            strInfo = _T("【确认中】等待房主确认走子...");
+        if (m_aiMode) {
+            strInfo = (snap.currentTurn == 0)
+                ? _T("轮到你（红方）走子")
+                : _T("电脑（蓝方）思考中……");
         }
         else {
-            strInfo = (snap.currentTurn == 1)
-                ? _T("【你的回合】蓝方")
-                : _T("【对方回合】等待红方走子...");
+            strInfo = (snap.currentTurn == m_myCamp)
+                ? _T("轮到你走子")
+                : _T("等待对方走子……");
         }
     }
 
-    memDC.DrawText(strInfo, &statusRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    CString strHead;
+    if (m_aiMode) {
+        strHead.Format(_T("[人机·%s] "), DifficultyName());
+    }
+    else {
+        strHead.Format(_T("[联机·%s] "), m_myCamp == 0 ? _T("红方") : _T("蓝方"));
+    }
+    memDC.DrawText(strHead + strInfo, &statusRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     memDC.SelectObject(pOldF);
 
     dc.BitBlt(0, 0, clientRc.Width(), clientRc.Height(), &memDC, 0, 0, SRCCOPY);
@@ -648,11 +347,42 @@ HCURSOR CanimalChessDlg::OnQueryDragIcon()
     return static_cast<HCURSOR>(m_hIcon);
 }
 
+void CanimalChessDlg::OnLocalMoveDone(uint8_t srcIdx, uint8_t dstIdx)
+{
+    if (m_aiMode) {
+        Invalidate(FALSE);
+        UpdateWindow();
+        // 玩家走完后在后台触发 AI（不阻塞界面）
+        if (Engine_TriggerAiAsync()) {
+            SetTimer(GAME_TIMER_AI, 150, nullptr);
+        }
+        else {
+        }
+        Invalidate(FALSE);
+    }
+    else {
+        NetMoveSync mv;
+        mv.srcIndex = srcIdx;
+        mv.dstIndex = dstIdx;
+        if (!Net_SendFrame(m_netSock, NET_MSG_MOVE_SYNC, &mv, (int)sizeof(mv))) {
+            HandlePeerGone();
+            return;
+        }
+        Invalidate(FALSE);
+    }
+}
+
 void CanimalChessDlg::OnLButtonDown(UINT nFlags, CPoint point)
 {
-    const int GRID_SIZE = 65;
-    const int OFFSET_X = 30;
-    const int OFFSET_Y = 40;
+    {
+        CRect wr;
+        GetWindowRect(&wr);
+    }
+
+    if (point.x < OFFSET_X || point.y < OFFSET_Y) {
+        CDialogEx::OnLButtonDown(nFlags, point);
+        return;
+    }
 
     if (point.x < OFFSET_X || point.y < OFFSET_Y) {
         CDialogEx::OnLButtonDown(nFlags, point);
@@ -669,34 +399,48 @@ void CanimalChessDlg::OnLButtonDown(UINT nFlags, CPoint point)
         MsgBoardSnapshot snap;
         Engine_GetSnapshot(snap);
 
-        if (IsLocalPlayersTurn(snap))
+        bool myTurn = IsMyTurn(snap);
         {
-            if (m_selectedIdx == -1) {
-                //未选中时，点击己方棋子则高亮。
-                if (IsLocalPiece(snap.board[clickedIdx])) {
+            CString dump;
+            for (int rr = 0; rr < BOARD_ROWS; rr++) {
+                CString line;
+                for (int cc = 0; cc < BOARD_COLS; cc++) {
+                    CString t;
+                    t.Format(L"%2d ", snap.board[rr * BOARD_COLS + cc]);
+                    line += t;
+                }
+                dump += line + L" | ";
+            }
+        }
+
+        if (snap.gameStatus == 0) {
+            if (!myTurn) {
+                // 非本机回合：清除残留选中状态
+                if (m_selectedIdx >= 0) { m_selectedIdx = -1; Invalidate(FALSE); }
+            }
+            else if (m_selectedIdx == -1) {
+                // 未选中时，点击己方棋子则高亮
+                if (IsMyColor(snap.board[clickedIdx])) {
                     m_selectedIdx = clickedIdx;
                     Invalidate(FALSE);
                 }
             }
             else {
-                if (IsLocalPiece(snap.board[clickedIdx])) {
-                    //改选其他己方棋子。
+                if (IsMyColor(snap.board[clickedIdx])) {
+                    // 改选其他己方棋子
                     m_selectedIdx = clickedIdx;
                     Invalidate(FALSE);
                 }
-                else {
-                    const uint8_t src = static_cast<uint8_t>(m_selectedIdx);
-                    ResetSelection();
-
-                    if (m_gameMode == GameMode::LocalAi) {
-                        if (Engine_TryMove(src, clickedIdx)) {
-                            Invalidate(FALSE);
-                            UpdateWindow();
-
-                            // 只有本地人机模式会触发 AI；联网走子均由远端玩家产生。
-                            Engine_TriggerAi();
-                            Invalidate(FALSE);
-                        }
+                else if (clickedIdx != m_selectedIdx) {
+                    // 提交走子请求
+                    uint8_t src = static_cast<uint8_t>(m_selectedIdx);
+                    bool moved = Engine_TryMove(src, clickedIdx);
+                    m_selectedIdx = -1;
+                    if (moved) {
+                        OnLocalMoveDone(src, clickedIdx);
+                    }
+                    else {
+                        Invalidate(FALSE);   // 非法走子被忽略
                     }
                     else if (m_gameMode == GameMode::LanHost) {
                         // 房主先在权威棋盘执行红方走子，再把已确认走子广播给客机。
@@ -732,8 +476,61 @@ void CanimalChessDlg::OnLButtonDown(UINT nFlags, CPoint point)
     CDialogEx::OnLButtonDown(nFlags, point);
 }
 
-void CanimalChessDlg::OnDestroy()
+void CanimalChessDlg::OnTimer(UINT_PTR nIDEvent)
 {
-    m_lanSession.Stop();
-    CDialogEx::OnDestroy();
+    if (nIDEvent == GAME_TIMER_AI) {
+        if (!Engine_IsAiThinking()) {
+            KillTimer(GAME_TIMER_AI);
+            // 电脑落子已完成：立即同步重绘，避免画面停留在思考前
+            Invalidate(FALSE);
+            UpdateWindow();
+            return;
+        }
+        Invalidate(FALSE);   // 思考中：刷新“思考中……”状态
+    }
+    CDialogEx::OnTimer(nIDEvent);
+}
+
+void CanimalChessDlg::OnBnClickedRestart()
+{
+    if (m_aiMode) StartNewGame();
+}
+
+void CanimalChessDlg::OnBnClickedBackLobby()
+{
+    EndDialog(IDOK);   // App 收到 IDOK 后回到大厅
+}
+
+LRESULT CanimalChessDlg::OnNetMove(WPARAM wParam, LPARAM /*lParam*/)
+{
+    if (m_netClosing || m_aiMode) return 0;
+    uint8_t src = static_cast<uint8_t>((wParam >> 8) & 0xFF);
+    uint8_t dst = static_cast<uint8_t>(wParam & 0xFF);
+
+    // 对端走子：以同样的确定性规则本地校验并落子
+    if (Engine_TryMove(src, dst)) {
+        m_selectedIdx = -1;
+        Invalidate(FALSE);
+    }
+    return 0;
+}
+
+LRESULT CanimalChessDlg::OnNetClosed(WPARAM /*wParam*/, LPARAM /*lParam*/)
+{
+    HandlePeerGone();
+    return 0;
+}
+
+void CanimalChessDlg::HandlePeerGone()
+{
+    if (m_netClosing) return;
+    m_netClosing = true;
+
+    KillTimer(GAME_TIMER_AI);
+    Net_CloseSession(m_netSock, m_netRecvThread);   // 回收连接与接收线程
+
+    if (GetSafeHwnd()) {
+        MessageBox(_T("对方已断开连接，本局结束。"), _T("联机对战"), MB_OK | MB_ICONINFORMATION);
+    }
+    EndDialog(IDOK);                 // 返回大厅
 }

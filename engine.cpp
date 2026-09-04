@@ -1,10 +1,15 @@
-﻿#include "pch.h"
+#include "pch.h"
 #include "engine.h"
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <random>
+#include <chrono>
 
 static const char g_szNames[25][5] = {
     "　",
@@ -341,11 +346,27 @@ int JungleEvaluator::Evaluate(const JungleBoard& board) {
     return (board.GetSide() == 0) ? (redScore - blueScore) : (blueScore - redScore);
 }
 
-AlphaBetaSearcher::AlphaBetaSearcher() {
+AlphaBetaSearcher::AlphaBetaSearcher()
+    : m_pAbort(nullptr)
+    , m_nodeCount(0)
+    , m_nodeLimit(0)
+    , m_limitHit(false)
+{
     m_historyTable.fill(0);
 }
 
+void AlphaBetaSearcher::SetAbortFlag(std::atomic<bool>* pAbort, int nodeLimit) {
+    m_pAbort = pAbort;
+    m_nodeLimit = nodeLimit;
+    m_limitHit = false;
+    m_nodeCount = 0;
+}
+
 int AlphaBetaSearcher::QuiescenceSearch(JungleBoard& board, int alpha, int beta, int depth) {
+    if ((++m_nodeCount & 1023) == 0) {
+        if (m_nodeLimit > 0 && m_nodeCount >= m_nodeLimit) { m_limitHit = true; return 0; }
+        if (m_pAbort && m_pAbort->load(std::memory_order_relaxed)) return 0;  // 中止请求：返回值将被丢弃
+    }
     if (board.IsMate()) return -99999;
     int val = JungleEvaluator::Evaluate(board);
     if (val >= beta) return beta;
@@ -367,6 +388,10 @@ int AlphaBetaSearcher::QuiescenceSearch(JungleBoard& board, int alpha, int beta,
 }
 
 int AlphaBetaSearcher::AlphaBeta(JungleBoard& board, int depth, int alpha, int beta, bool isRoot) {
+    if ((++m_nodeCount & 1023) == 0) {
+        if (m_nodeLimit > 0 && m_nodeCount >= m_nodeLimit) { m_limitHit = true; return 0; }
+        if (m_pAbort && m_pAbort->load(std::memory_order_relaxed)) return 0;  // 中止请求：返回值将被丢弃
+    }
     if (board.IsMate()) return -99999 + (10 - depth);
     if (depth <= 0) return QuiescenceSearch(board, alpha, beta, 4);
 
@@ -413,6 +438,8 @@ int AlphaBetaSearcher::SearchBestMove(JungleBoard& board, int depth) {
     if (moves.empty()) return 0;
     if (moves.size() == 1) return moves[0];
 
+    if ((m_pAbort && m_pAbort->load(std::memory_order_relaxed)) ||
+        (m_nodeLimit > 0 && m_nodeCount >= m_nodeLimit)) return 0;
     return AlphaBeta(board, depth, -999999, 999999, true);
 }
 
@@ -421,22 +448,68 @@ static AlphaBetaSearcher g_searcher;
 static int g_lastMove = 0;
 static uint8_t g_gameStatus = 0;
 
-static void UpdateGameStatusAfterMove(int movingSide) {
+// ================= 大厅新增：引擎线程化状态 =================
+static std::mutex g_engineMtx;        // 保护 g_board / g_lastMove / g_gameStatus 等共享状态
+static std::thread g_aiThread;        // 异步 AI 后台线程
+static std::atomic<bool> g_aiRunning{ false };
+static std::atomic<bool> g_aiAbort{ false };
+static std::atomic<int>  g_aiLevel{ 2 };
+
+static int AiDepthForLevel(int level) {
+    if (level <= 1) return 2;   // 简单：浅层搜索
+    if (level == 2) return 4;   // 中等：标准
+    return 6;                   // 困难：迭代加深的上限层数
+}
+
+// 困难档每层搜索的节点预算（迭代加深；超过预算立即放弃该层并回退到上一完整层）
+static const int HARD_NODE_BUDGET[5] = { 120000, 300000, 700000, 1500000, 2800000 };
+
+// 按难度选取一步棋（level 3 = 困难：2→6 层迭代加深 + 逐层节点预算，保证思考时间可控）。
+// pAbort 非空时搜索过程中会响应外部中止请求（返回的走法将被调用方丢弃）。
+static int EngineSearchBest(JungleBoard& board, int level, std::atomic<bool>* pAbort) {
+    if (level < 3) {
+        g_searcher.SetAbortFlag(pAbort);
+        return g_searcher.SearchBestMove(board, AiDepthForLevel(level));
+    }
+
+    int lastMv = 0;
+    for (int i = 0; i < 5; i++) {
+        g_searcher.SetAbortFlag(pAbort, HARD_NODE_BUDGET[i]);
+        int dmv = g_searcher.SearchBestMove(board, i + 2);
+        if (g_searcher.LimitHit()) break;      // 该层超预算：采用上一层结果
+        if (pAbort && pAbort->load(std::memory_order_relaxed)) break;
+        lastMv = dmv;
+    }
+    g_searcher.SetAbortFlag(nullptr, 0);
+    return lastMv;
+}
+
+// 假定调用者已持有 g_engineMtx：结算刚发生的走子是否直接终局
+static void EngineFinishMoveLocked(int mateStatus) {
     if (g_board.IsMate()) {
-        g_gameStatus = (movingSide == 0) ? 1 : 2;
+        g_gameStatus = static_cast<uint8_t>(mateStatus);
     }
     else if (g_board.IsRepetition()) {
-        g_gameStatus = 3;
+        g_gameStatus = 3;       // 重复局面判和
     }
 }
 
 void Engine_Startup() {
+    // 若上一局还有 AI 在后台思考，先请求中止并等待其退出
+    g_aiAbort.store(true);
+    if (g_aiThread.joinable()) g_aiThread.join();
+
+    std::lock_guard<std::mutex> lk(g_engineMtx);
+    g_aiRunning.store(false);
+    g_aiAbort.store(false);
     g_board.Reset();
     g_lastMove = 0;
     g_gameStatus = 0;
 }
 
 void Engine_GetSnapshot(MsgBoardSnapshot& outSnapshot) {
+    std::lock_guard<std::mutex> lk(g_engineMtx);
+
     outSnapshot.gameStatus = g_gameStatus;
     outSnapshot.currentTurn = static_cast<uint8_t>(g_board.GetSide());
 
@@ -457,6 +530,7 @@ void Engine_GetSnapshot(MsgBoardSnapshot& outSnapshot) {
 
 bool Engine_IsLegalMove(uint8_t srcIdx, uint8_t dstIdx) {
     if (srcIdx >= BOARD_CELL_COUNT || dstIdx >= BOARD_CELL_COUNT) return false;
+    std::lock_guard<std::mutex> lk(g_engineMtx);
     if (g_gameStatus != 0) return false;
 
     int src = JungleBoard::IndexToSq(srcIdx);
@@ -468,6 +542,7 @@ bool Engine_IsLegalMove(uint8_t srcIdx, uint8_t dstIdx) {
 bool Engine_TryMove(uint8_t srcIdx, uint8_t dstIdx) {
     if (!Engine_IsLegalMove(srcIdx, dstIdx)) return false;
 
+    std::lock_guard<std::mutex> lk(g_engineMtx);
     int src = JungleBoard::IndexToSq(srcIdx);
     int dst = JungleBoard::IndexToSq(dstIdx);
     int mv = MOVE(src, dst);
@@ -475,25 +550,135 @@ bool Engine_TryMove(uint8_t srcIdx, uint8_t dstIdx) {
 
     g_board.MakeMove(mv);
     g_lastMove = mv;
-    UpdateGameStatusAfterMove(movingSide);
+    EngineFinishMoveLocked(movingSide == 0 ? 1 : 2);   // 无论红方还是蓝方绝杀，均正确记录胜利方
 
     return true;
 }
 
-bool Engine_TriggerAi() {
-    if (g_gameStatus != 0 || g_board.GetSide() != 1) return false;
+void Engine_SetAiLevel(int level) {
+    if (level < 1) level = 1;
+    if (level > 3) level = 3;
+    g_aiLevel.store(level);
+}
 
-    int movingSide = g_board.GetSide();
-    int mv = g_searcher.SearchBestMove(g_board, 4);
-    if (mv == 0) {
-        g_gameStatus = (movingSide == 0) ? 2 : 1;
-        return true;
+int Engine_GetAiLevel() {
+    return g_aiLevel.load();
+}
+
+void Engine_AbortAiRequest() {
+    g_aiAbort.store(true);
+}
+
+void Engine_Shutdown() {
+    g_aiAbort.store(true);
+    if (g_aiThread.joinable()) g_aiThread.join();
+}
+
+// ================= 异步 AI：后台线程体 =================
+// 在“棋盘副本”上搜索，UI 线程与引擎锁均不被阻塞；
+// 简单档另有约 30% 概率直接随机选择合法走法（模拟新手失误）。
+static void EngineAiWorkerMain() {
+    JungleBoard work;
+    int level = 2;
+    bool easy = false;
+    {
+        std::lock_guard<std::mutex> lk(g_engineMtx);
+        work = g_board;
+        level = g_aiLevel.load();
+        easy = (level == 1);
+        g_aiAbort.store(false);   // 新一轮搜索从干净状态开始
     }
 
-    g_lastMove = mv;
-    g_board.MakeMove(mv);
-    UpdateGameStatusAfterMove(movingSide);
+    int mv = 0;
+    if (easy && !g_aiAbort.load()) {
+        std::vector<int> legal;
+        work.GenerateMoves(legal);
+        if (!legal.empty()) {
+            unsigned seed = static_cast<unsigned>(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            std::mt19937 rng(seed);
+            std::uniform_int_distribution<int> dRoll(0, 99);
+            if (dRoll(rng) < 30) {
+                std::uniform_int_distribution<int> dIdx(0, static_cast<int>(legal.size()) - 1);
+                mv = legal[dIdx(rng)];
+            }
+        }
+    }
 
+    if (mv == 0 && !g_aiAbort.load()) {
+        g_aiAbort.store(false);
+        mv = EngineSearchBest(work, level, &g_aiAbort);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_engineMtx);
+        g_aiRunning.store(false);
+        const bool aborted = g_aiAbort.exchange(false);
+        if (!aborted && g_gameStatus == 0 && g_board.GetSide() == 1) {
+            if (mv != 0 && g_board.IsLegalMove(mv)) {
+                g_board.MakeMove(mv);
+                g_lastMove = mv;
+                EngineFinishMoveLocked(2);   // 蓝方(电脑)走出绝杀则蓝胜
+            }
+            else {
+                // 电脑无子可走（仅理论情形）：判定玩家(红方)胜
+                g_gameStatus = 1;
+            }
+        }
+    }
+}
+
+bool Engine_TriggerAiAsync() {
+    {
+        std::lock_guard<std::mutex> lk(g_engineMtx);
+        if (g_gameStatus != 0 || g_board.GetSide() != 1 || g_aiRunning.load()) return false;
+    }
+    if (g_aiThread.joinable()) g_aiThread.join();
+
+    {
+        std::lock_guard<std::mutex> lk(g_engineMtx);
+        g_aiRunning.store(true);
+        g_aiAbort.store(false);
+    }
+    g_aiThread = std::thread(&EngineAiWorkerMain);
+    return true;
+}
+
+bool Engine_IsAiThinking() {
+    return g_aiRunning.load();
+}
+
+// 同步触发（保留旧接口语义，供非 UI 线程/脚本直接驱动）
+bool Engine_TriggerAi() {
+    {
+        std::lock_guard<std::mutex> lk(g_engineMtx);
+        if (g_gameStatus != 0 || g_board.GetSide() != 1 || g_aiRunning.load()) return false;
+    }
+    if (g_aiThread.joinable()) g_aiThread.join();
+
+    JungleBoard work;
+    int level = 2;
+    int mv = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_engineMtx);
+        work = g_board;
+        level = g_aiLevel.load();
+        g_aiAbort.store(false);
+    }
+
+    mv = EngineSearchBest(work, level, nullptr);
+
+    {
+        std::lock_guard<std::mutex> lk(g_engineMtx);
+        if (mv != 0 && g_board.IsLegalMove(mv)) {
+            g_board.MakeMove(mv);
+            g_lastMove = mv;
+            EngineFinishMoveLocked(2);
+        }
+        else if (g_gameStatus == 0 && g_board.GetSide() == 1) {
+            g_gameStatus = 1;
+        }
+    }
     return true;
 }
 
